@@ -1,0 +1,140 @@
+name: Release IPA
+
+# Builds a Release archive using your own signing credentials and profile.
+#
+# Secrets (set with `gh secret set`):
+#   P12_BASE64       base64 of certs/Development.p12
+#   P12_PASSWORD     the p12 password
+#   PROFILE_BASE64   base64 of profiles/Development.mobileprovision
+#   SIGN_IDENTITY    your certificate's signing identity
+#   DEVELOPMENT_TEAM your Apple developer team identifier
+#
+# Set repository variable BUNDLE_ID to the App ID in your provisioning profile.
+# MACOS_RUNNER can select a runner with the required Xcode and iOS SDK installed.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  ipa:
+    name: Signed IPA
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-latest' }}
+    timeout-minutes: 60
+    env:
+      BUNDLE_ID: ${{ vars.BUNDLE_ID || 'org.example.BudProbe' }}
+      DEVELOPMENT_TEAM: ${{ secrets.DEVELOPMENT_TEAM }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          brew install xcodegen xcbeautify || brew install xcodegen
+
+      - name: Generate the project
+        run: xcodegen generate
+
+      - name: Import the signing certificate
+        env:
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$P12_BASE64" | base64 --decode > /tmp/dev.p12
+          security create-keychain -p actions temp.keychain
+          security set-keychain-settings -lut 3600 temp.keychain
+          security unlock-keychain -p actions temp.keychain
+          security import /tmp/dev.p12 -k temp.keychain -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions temp.keychain
+          security list-keychains -d user -s temp.keychain
+          security default-keychain -s temp.keychain
+          security find-identity -v -p codesigning temp.keychain
+          rm -f /tmp/dev.p12
+
+      - name: Archive, sign and pack the IPA
+        env:
+          PROFILE_BASE64: ${{ secrets.PROFILE_BASE64 }}
+          SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          mkdir -p .build exports
+
+          echo "== archiving =="
+          set +e
+          xcodebuild -project BudProbe.xcodeproj -scheme BudProbe \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath .build/BudProbe.xcarchive \
+            -derivedDataPath .build/DerivedData \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive > .build/archive.log 2>&1
+          status=$?
+          set -e
+          xcbeautify < .build/archive.log || true
+          if [ "$status" -ne 0 ]; then
+            echo "=================== ARCHIVE ERRORS ==================="
+            grep -n -B4 -A8 "error:" .build/archive.log | head -300
+            echo "====================================================="
+            exit "$status"
+          fi
+
+          APP=".build/BudProbe.xcarchive/Products/Applications/BudProbe.app"
+          if [ ! -d "$APP" ]; then
+            echo "pinned path was empty, searching:"
+            find .build -maxdepth 8 -type d -name '*.app' | head -10
+            APP="$(find .build -maxdepth 8 -type d -name 'BudProbe.app' | head -1 || true)"
+          fi
+          [ -n "$APP" ] && [ -d "$APP" ] || { echo "no app bundle produced" >&2; exit 1; }
+          echo "app: $APP"
+
+          echo "== profile and entitlements =="
+          echo "$PROFILE_BASE64" | base64 --decode > /tmp/dev.mobileprovision
+          cp /tmp/dev.mobileprovision "$APP/embedded.mobileprovision"
+          python3 - <<'PY' > /tmp/entitlements.plist
+          import plistlib, subprocess, sys
+          raw = subprocess.run(["openssl", "smime", "-inform", "der", "-verify", "-noverify",
+                                "-in", "/tmp/dev.mobileprovision"], capture_output=True, check=True).stdout
+          plistlib.dump(plistlib.loads(raw)["Entitlements"], sys.stdout.buffer)
+          PY
+          plutil -p /tmp/entitlements.plist | head -20
+
+          echo "== Info.plist assertions =="
+          python3 - "$APP/Info.plist" <<'PY'
+          import os, plistlib, sys
+          plist = plistlib.load(open(sys.argv[1], "rb"))
+          bad = []
+          if plist.get("CFBundleIdentifier") != os.environ["BUNDLE_ID"]:
+              bad.append("bundle id " + str(plist.get("CFBundleIdentifier")))
+          if not plist.get("NSBluetoothAlwaysUsageDescription"):
+              bad.append("missing bluetooth usage string")
+          if "bluetooth-central" not in (plist.get("UIBackgroundModes") or []):
+              bad.append("missing bluetooth-central background mode")
+          if bad:
+              print("FAILED:", bad)
+              sys.exit(1)
+          print("Info.plist ok:", plist.get("CFBundleIdentifier"),
+                plist.get("CFBundleShortVersionString"))
+          PY
+
+          echo "== signing =="
+          codesign --force --sign "$SIGN_IDENTITY" --entitlements /tmp/entitlements.plist \
+            --timestamp=none --generate-entitlement-der "$APP"
+          codesign --verify --verbose=2 "$APP"
+
+          echo "== packing =="
+          mkdir -p .build/Payload
+          cp -R "$APP" .build/Payload/
+          (cd .build && zip -qry ../exports/BudProbe.ipa Payload)
+          shasum -a 256 exports/BudProbe.ipa
+          ls -lh exports/BudProbe.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BudProbe-ipa
+          path: exports/BudProbe.ipa
+          if-no-files-found: error

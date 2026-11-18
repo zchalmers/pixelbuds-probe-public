@@ -1,0 +1,50 @@
+name: BudProbe
+
+# XcodeGen spec. The project file is generated, never committed.
+options:
+  bundleIdPrefix: org.example
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+  xcodeVersion: "27.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: minimal
+    SWIFT_DEFAULT_ACTOR_ISOLATION: nonisolated
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  BudProbe:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes:
+          - "Resources/Info.plist"
+    settings:
+      base:
+        # Override at build time to match your own provisioning profile.
+        PRODUCT_BUNDLE_IDENTIFIER: org.example.BudProbe
+        PRODUCT_NAME: BudProbe
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: App/Resources/Info.plist
+        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+        SUPPORTS_MACCATALYST: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+
+schemes:
+  BudProbe:
+    build:
+      targets:
+        BudProbe: all
+    run:
+      config: Debug
+    archive:
+      config: Release
